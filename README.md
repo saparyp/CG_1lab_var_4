@@ -6,8 +6,8 @@
 
 Если вы еще этого не сделали, клонируйте репозиторий или убедитесь, что вы находитесь в корневой папке проекта:
 ```bash
-git clone https://github.com/ваш-username/ваш-репозиторий.git
-cd ваш-репозиторий
+git clone https://github.com/saparyp/CG_1lab_var_4
+cd CG_1lab_var_4
 ```
 
 ### 2. Конфигурация проекта
