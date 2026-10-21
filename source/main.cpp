@@ -79,10 +79,10 @@ int main() {
         ImGui_ImplGlfw_NewFrame();
 
         ImGui::NewFrame();
+        graphics::internal::FrameData fd = graphics::internal::prepare();
         application::update(time);
         ImGui::Render();
 
-        graphics::internal::FrameData fd = graphics::internal::prepare();
         application::render(fd);
         graphics::internal::submitAndPresent();
     }

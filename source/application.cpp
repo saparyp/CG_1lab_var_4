@@ -1,478 +1,816 @@
 #include "application.hpp"
-#include "graphics_internal.hpp"
-#include <glm/gtc/matrix_transform.hpp>
 
 #include <imgui.h>
-#include <array>
 #include <vk_mem_alloc.h>
+#include <glm/gtc/matrix_transform.hpp>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstring>
 #include <fstream>
-#include <stdexcept>
 #include <iostream>
+#include <stdexcept>
+#include <string>
 
 namespace application {
+namespace {
 
-void buildImGui();
+struct alignas(16) SceneUniformBuffer {
+    glm::mat4 viewProjection;
+    glm::vec4 cameraPosition;
+    glm::vec4 ambientColorIntensity;
+    glm::vec4 directionalDirection;
+    glm::vec4 directionalColorIntensity;
+    glm::uvec4 lightCounts;
+};
 
-// 1. GLOBAL VARIABLES
-std::vector<Vertex> vertices;
-std::vector<uint32_t> indices;
+struct alignas(16) ModelUniformBuffer {
+    glm::mat4 model;
+    glm::vec4 albedo;
+    glm::vec4 specularColor;
+    glm::vec4 materialParameters;
+};
 
-VkPipeline pipeline = VK_NULL_HANDLE;
-VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
-VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
-VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
-VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+struct alignas(16) PointLightGpu {
+    glm::vec4 position;
+    glm::vec4 colorIntensity;
+};
 
-VkBuffer vertexBuffer = VK_NULL_HANDLE;
-VmaAllocation vertexBufferAllocation = VK_NULL_HANDLE;
+struct alignas(16) SpotLightGpu {
+    glm::vec4 position;
+    glm::vec4 direction;
+    glm::vec4 colorIntensity;
+    glm::vec4 coneCosines;
+};
 
-VkBuffer indexBuffer = VK_NULL_HANDLE;
-VmaAllocation indexBufferAllocation = VK_NULL_HANDLE;
+static_assert(sizeof(SceneUniformBuffer) == 144);
+static_assert(sizeof(ModelUniformBuffer) == 112);
+static_assert(sizeof(PointLightGpu) == 32);
+static_assert(sizeof(SpotLightGpu) == 64);
 
-VkBuffer uniformBuffer = VK_NULL_HANDLE;
-VmaAllocation uniformBufferAllocation = VK_NULL_HANDLE;
-void* uniformBufferMapped = nullptr;
+struct PointLight {
+    glm::vec3 position{2.0f, 2.0f, 2.0f};
+    glm::vec3 color{1.0f, 0.75f, 0.45f};
+    float intensity{18.0f};
+};
 
-// Задание 2: Позиция, поворот, масштаб
-glm::vec3 position = {0.0f, 0.0f, 0.0f};
-glm::vec3 rotation = {0.0f, 0.0f, 0.0f};
-float scale = 1.0f;
+struct SpotLight {
+    glm::vec3 position{-2.0f, 2.5f, 2.0f};
+    glm::vec3 direction{0.4f, -0.5f, -1.0f};
+    glm::vec3 color{0.55f, 0.7f, 1.0f};
+    float intensity{30.0f};
+    float innerAngle{12.0f};
+    float outerAngle{22.0f};
+};
 
-// Задание 4: Базовый цвет фигуры
-glm::vec4 baseColor = {1.0f, 1.0f, 1.0f, 1.0f}; // Белый по умолчанию
+struct MappedStorageBuffer {
+    VkBuffer buffer{VK_NULL_HANDLE};
+    VmaAllocation allocation{VK_NULL_HANDLE};
+    void* mapped{nullptr};
+    VkDeviceSize capacity{0};
+};
 
-// Задание 3: Параметры анимации
-bool isAnimating = false;
-float animSpeed = 1.0f;
-float trajectoryRadius = 2.0f;
-float animTime = 0.0f;
+VkDescriptorSetLayout sceneDescriptorSetLayout{VK_NULL_HANDLE};
+VkDescriptorSetLayout modelDescriptorSetLayout{VK_NULL_HANDLE};
+VkDescriptorPool descriptorPool{VK_NULL_HANDLE};
+VkDescriptorSet sceneDescriptorSet{VK_NULL_HANDLE};
+VkDescriptorSet modelDescriptorSet{VK_NULL_HANDLE};
 
-// Переключение проекции (Задание 1)
-bool usePerspective = true;
-float fov = 45.0f;
+VkBuffer sceneUniformBuffer{VK_NULL_HANDLE};
+VmaAllocation sceneUniformBufferAllocation{VK_NULL_HANDLE};
+void* sceneUniformBufferMapped{nullptr};
+VkBuffer modelUniformBuffer{VK_NULL_HANDLE};
+VmaAllocation modelUniformBufferAllocation{VK_NULL_HANDLE};
+void* modelUniformBufferMapped{nullptr};
+MappedStorageBuffer pointLightBuffer;
+MappedStorageBuffer spotLightBuffer;
 
-// 2. HELPER FUNCTIONS & STRUCTS
+glm::vec3 modelPosition{0.0f};
+glm::vec3 modelRotation{0.0f};
+float modelScale{1.0f};
+glm::vec3 cameraPosition{0.0f, 0.0f, 5.0f};
+float cameraYaw{-90.0f};
+float cameraPitch{0.0f};
+float fov{45.0f};
+bool usePerspective{true};
+float orthographicSize{4.0f};
+glm::vec4 albedo{0.7f, 0.28f, 0.12f, 1.0f};
+glm::vec3 specularColor{1.0f};
+float shininess{48.0f};
+glm::vec3 ambientColor{0.16f};
+float ambientIntensity{0.35f};
+glm::vec3 directionalDirection{-0.4f, -1.0f, -0.5f};
+glm::vec3 directionalColor{1.0f, 0.95f, 0.82f};
+float directionalIntensity{1.0f};
+std::vector<PointLight> pointLights{{}};
+std::vector<SpotLight> spotLights{{}};
+bool isAnimating{false};
+float animationSpeed{1.0f};
+float trajectoryRadius{2.0f};
+float animationTime{0.0f};
 
-static std::vector<char> readFile(const std::string& filename) {
+VkDevice device() {
+    return graphics::internal::context.device;
+}
+
+void checkVk(VkResult result, const char* operation) {
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(std::string(operation) + " failed with VkResult " +
+                                 std::to_string(result));
+    }
+}
+
+std::vector<char> readFile(const std::string& filename) {
     std::ifstream file(filename, std::ios::ate | std::ios::binary);
-    if (!file.is_open()) throw std::runtime_error("Failed to open file: " + filename);
-    size_t fileSize = (size_t)file.tellg();
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open shader file: " + filename);
+    }
+    const auto fileSize = static_cast<size_t>(file.tellg());
     std::vector<char> buffer(fileSize);
     file.seekg(0);
-    file.read(buffer.data(), fileSize);
-    file.close();
+    file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
+    if (!file) {
+        throw std::runtime_error("Failed to read shader file: " + filename);
+    }
     return buffer;
 }
 
-static VkShaderModule createShaderModule(const std::vector<char>& code) {
+VkShaderModule createShaderModule(const std::vector<char>& code) {
     VkShaderModuleCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     createInfo.codeSize = code.size();
     createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-    VkShaderModule shaderModule;
-    if (vkCreateShaderModule(graphics::internal::context.device, &createInfo, nullptr, &shaderModule) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create shader module!");
-    }
+    VkShaderModule shaderModule{VK_NULL_HANDLE};
+    checkVk(vkCreateShaderModule(device(), &createInfo, nullptr, &shaderModule),
+            "vkCreateShaderModule");
     return shaderModule;
 }
 
-VkVertexInputBindingDescription Vertex::getBindingDescription() {
-    VkVertexInputBindingDescription bindingDescription{};
-    bindingDescription.binding = 0;
-    bindingDescription.stride = sizeof(Vertex);
-    bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-    return bindingDescription;
-}
-
-std::array<VkVertexInputAttributeDescription, 2> Vertex::getAttributeDescriptions() {
-    std::array<VkVertexInputAttributeDescription, 2> attributeDescriptions{};
-    attributeDescriptions[0].binding = 0; attributeDescriptions[0].location = 0;
-    attributeDescriptions[0].format = VK_FORMAT_R32G32B32_SFLOAT; attributeDescriptions[0].offset = offsetof(Vertex, pos);
-    attributeDescriptions[1].binding = 0; attributeDescriptions[1].location = 1;
-    attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT; attributeDescriptions[1].offset = offsetof(Vertex, color);
-    return attributeDescriptions;
-}
-
-static void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VmaMemoryUsage memoryUsage, VkBuffer& buffer, VmaAllocation& allocation) {
+void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VmaMemoryUsage memoryUsage,
+                  VkBuffer& buffer, VmaAllocation& allocation) {
     VkBufferCreateInfo bufferInfo{};
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferInfo.size = size; bufferInfo.usage = usage; bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VmaAllocationCreateInfo allocInfo{}; allocInfo.usage = memoryUsage;
-    auto& ctx = graphics::internal::context;
-    if (vmaCreateBuffer(ctx.allocator, &bufferInfo, &allocInfo, &buffer, &allocation, nullptr) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create buffer!");
-    }
+    bufferInfo.size = size;
+    bufferInfo.usage = usage;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo allocationInfo{};
+    allocationInfo.usage = memoryUsage;
+    checkVk(vmaCreateBuffer(graphics::internal::context.allocator, &bufferInfo, &allocationInfo,
+                            &buffer, &allocation, nullptr),
+            "vmaCreateBuffer");
 }
 
-// 3. GEOMETRY: TRUNCATED TETRAHEDRON (Задание 5: Процедурный цвет)
+void createMappedBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                        VkBuffer& buffer, VmaAllocation& allocation, void*& mapped) {
+    createBuffer(size, usage, VMA_MEMORY_USAGE_CPU_TO_GPU, buffer, allocation);
+    checkVk(vmaMapMemory(graphics::internal::context.allocator, allocation, &mapped),
+            "vmaMapMemory");
+}
+
+glm::vec3 faceNormal(const std::vector<glm::vec3>& face) {
+    glm::vec3 normal = glm::normalize(glm::cross(face[1] - face[0], face[2] - face[0]));
+    glm::vec3 center{0.0f};
+    for (const auto& vertex : face) {
+        center += vertex;
+    }
+    center /= static_cast<float>(face.size());
+    if (glm::dot(normal, center) < 0.0f) {
+        normal = -normal;
+    }
+    return normal;
+}
+
 void createTruncatedTetrahedron() {
-    glm::vec3 v0 = { 1.0f,  1.0f,  1.0f};
-    glm::vec3 v1 = { 1.0f, -1.0f, -1.0f};
-    glm::vec3 v2 = {-1.0f,  1.0f, -1.0f};
-    glm::vec3 v3 = {-1.0f, -1.0f,  1.0f};
+    const glm::vec3 v0{1.0f, 1.0f, 1.0f};
+    const glm::vec3 v1{1.0f, -1.0f, -1.0f};
+    const glm::vec3 v2{-1.0f, 1.0f, -1.0f};
+    const glm::vec3 v3{-1.0f, -1.0f, 1.0f};
+    const auto lerp = [](glm::vec3 a, glm::vec3 b, float t) { return a + (b - a) * t; };
 
-    auto lerp = [](glm::vec3 a, glm::vec3 b, float t) { return a + (b - a) * t; };
+    const glm::vec3 e01a = lerp(v0, v1, 1.0f / 3.0f), e01b = lerp(v0, v1, 2.0f / 3.0f);
+    const glm::vec3 e02a = lerp(v0, v2, 1.0f / 3.0f), e02b = lerp(v0, v2, 2.0f / 3.0f);
+    const glm::vec3 e03a = lerp(v0, v3, 1.0f / 3.0f), e03b = lerp(v0, v3, 2.0f / 3.0f);
+    const glm::vec3 e12a = lerp(v1, v2, 1.0f / 3.0f), e12b = lerp(v1, v2, 2.0f / 3.0f);
+    const glm::vec3 e13a = lerp(v1, v3, 1.0f / 3.0f), e13b = lerp(v1, v3, 2.0f / 3.0f);
+    const glm::vec3 e23a = lerp(v2, v3, 1.0f / 3.0f), e23b = lerp(v2, v3, 2.0f / 3.0f);
 
-    glm::vec3 e01_a = lerp(v0, v1, 1.0f/3.0f), e01_b = lerp(v0, v1, 2.0f/3.0f);
-    glm::vec3 e02_a = lerp(v0, v2, 1.0f/3.0f), e02_b = lerp(v0, v2, 2.0f/3.0f);
-    glm::vec3 e03_a = lerp(v0, v3, 1.0f/3.0f), e03_b = lerp(v0, v3, 2.0f/3.0f);
-    glm::vec3 e12_a = lerp(v1, v2, 1.0f/3.0f), e12_b = lerp(v1, v2, 2.0f/3.0f);
-    glm::vec3 e13_a = lerp(v1, v3, 1.0f/3.0f), e13_b = lerp(v1, v3, 2.0f/3.0f);
-    glm::vec3 e23_a = lerp(v2, v3, 1.0f/3.0f), e23_b = lerp(v2, v3, 2.0f/3.0f);
-
-    // Лямбда теперь не принимает цвет, а вычисляет его процедурно
-    auto addFace = [&](const std::vector<glm::vec3>& faceVerts) {
-        uint32_t startIndex = static_cast<uint32_t>(vertices.size());
-        for (const auto& v : faceVerts) {
-            // Задание 5: Процедурный цвет на основе локальных координат.
-            // Координаты примерно от -1.5 до 1.5. Нормализуем их в диапазон [0.0, 1.0] для RGB.
-            glm::vec3 procColor = (v + glm::vec3(1.5f)) / 3.0f;
-            vertices.push_back({v, procColor});
+    const auto addFace = [](const std::vector<glm::vec3>& face) {
+        const uint32_t first = static_cast<uint32_t>(vertices.size());
+        const glm::vec3 normal = faceNormal(face);
+        for (const auto& position : face) {
+            vertices.push_back({position, normal});
         }
-        for (size_t i = 1; i < faceVerts.size() - 1; ++i) {
-            indices.push_back(startIndex);
-            indices.push_back(startIndex + static_cast<uint32_t>(i));
-            indices.push_back(startIndex + static_cast<uint32_t>(i) + 1);
+        for (size_t i = 1; i + 1 < face.size(); ++i) {
+            indices.push_back(first);
+            indices.push_back(first + static_cast<uint32_t>(i));
+            indices.push_back(first + static_cast<uint32_t>(i + 1));
         }
     };
 
-    // Вызываем без указания цвета
-    addFace({e01_a, e02_a, e03_a});
-    addFace({e01_b, e13_a, e12_a});
-    addFace({e02_b, e12_b, e23_a});
-    addFace({e03_b, e13_b, e23_b});
-    addFace({e01_a, e01_b, e12_a, e12_b, e02_b, e02_a});
-    addFace({e01_a, e03_a, e03_b, e13_b, e13_a, e01_b});
-    addFace({e02_a, e02_b, e23_a, e23_b, e03_b, e03_a});
-    addFace({e12_a, e12_b, e23_a, e23_b, e13_b, e13_a});
+    addFace({e01a, e02a, e03a});
+    addFace({e01b, e13a, e12a});
+    addFace({e02b, e12b, e23a});
+    addFace({e03b, e13b, e23b});
+    addFace({e01a, e01b, e12a, e12b, e02b, e02a});
+    addFace({e01a, e03a, e03b, e13b, e13a, e01b});
+    addFace({e02a, e02b, e23a, e23b, e03b, e03a});
+    addFace({e12a, e12b, e23a, e23b, e13b, e13a});
 }
 
-// 4. VULKAN INITIALIZATION
-void createDescriptorSetLayout() {
-    VkDescriptorSetLayoutBinding uboLayoutBinding{};
-    uboLayoutBinding.binding = 0; uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    uboLayoutBinding.descriptorCount = 1; uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-    VkDescriptorSetLayoutCreateInfo layoutInfo{};
-    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 1; layoutInfo.pBindings = &uboLayoutBinding;
-    vkCreateDescriptorSetLayout(graphics::internal::context.device, &layoutInfo, nullptr, &descriptorSetLayout);
-}
-
-void createBuffers() {
+void createGeometryBuffers() {
     auto& ctx = graphics::internal::context;
-    VkDeviceSize vertexSize = sizeof(vertices[0]) * vertices.size();
-    VkDeviceSize indexSize = sizeof(indices[0]) * indices.size();
+    const VkDeviceSize vertexSize = sizeof(vertices[0]) * vertices.size();
+    const VkDeviceSize indexSize = sizeof(indices[0]) * indices.size();
 
-    VkBuffer stagingVertexBuffer, stagingIndexBuffer;
-    VmaAllocation stagingVertexAlloc, stagingIndexAlloc;
-    createBuffer(vertexSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY, stagingVertexBuffer, stagingVertexAlloc);
-    createBuffer(indexSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY, stagingIndexBuffer, stagingIndexAlloc);
+    VkBuffer stagingVertexBuffer{VK_NULL_HANDLE}, stagingIndexBuffer{VK_NULL_HANDLE};
+    VmaAllocation stagingVertexAllocation{VK_NULL_HANDLE}, stagingIndexAllocation{VK_NULL_HANDLE};
+    createBuffer(vertexSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY,
+                 stagingVertexBuffer, stagingVertexAllocation);
+    createBuffer(indexSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY,
+                 stagingIndexBuffer, stagingIndexAllocation);
 
-    void* data;
-    vmaMapMemory(ctx.allocator, stagingVertexAlloc, &data); memcpy(data, vertices.data(), vertexSize); vmaUnmapMemory(ctx.allocator, stagingVertexAlloc);
-    vmaMapMemory(ctx.allocator, stagingIndexAlloc, &data); memcpy(data, indices.data(), indexSize); vmaUnmapMemory(ctx.allocator, stagingIndexAlloc);
+    void* data{nullptr};
+    checkVk(vmaMapMemory(ctx.allocator, stagingVertexAllocation, &data), "vmaMapMemory");
+    std::memcpy(data, vertices.data(), static_cast<size_t>(vertexSize));
+    checkVk(vmaFlushAllocation(ctx.allocator, stagingVertexAllocation, 0, vertexSize),
+            "vmaFlushAllocation");
+    vmaUnmapMemory(ctx.allocator, stagingVertexAllocation);
+    checkVk(vmaMapMemory(ctx.allocator, stagingIndexAllocation, &data), "vmaMapMemory");
+    std::memcpy(data, indices.data(), static_cast<size_t>(indexSize));
+    checkVk(vmaFlushAllocation(ctx.allocator, stagingIndexAllocation, 0, indexSize),
+            "vmaFlushAllocation");
+    vmaUnmapMemory(ctx.allocator, stagingIndexAllocation);
 
-    createBuffer(vertexSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_ONLY, vertexBuffer, vertexBufferAllocation);
-    createBuffer(indexSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_ONLY, indexBuffer, indexBufferAllocation);
+    createBuffer(vertexSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VMA_MEMORY_USAGE_GPU_ONLY, vertexBuffer, vertexBufferAllocation);
+    createBuffer(indexSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                 VMA_MEMORY_USAGE_GPU_ONLY, indexBuffer, indexBufferAllocation);
 
     VkCommandPoolCreateInfo poolInfo{};
-    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO; poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
     poolInfo.queueFamilyIndex = ctx.graphics_queue_index;
-    VkCommandPool tempCommandPool;
-    vkCreateCommandPool(ctx.device, &poolInfo, nullptr, &tempCommandPool);
+    VkCommandPool commandPool{VK_NULL_HANDLE};
+    checkVk(vkCreateCommandPool(ctx.device, &poolInfo, nullptr, &commandPool), "vkCreateCommandPool");
 
-    VkCommandBufferAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO; allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandPool = tempCommandPool; allocInfo.commandBufferCount = 1;
-    VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(ctx.device, &allocInfo, &cmd);
+    VkCommandBufferAllocateInfo allocateInfo{};
+    allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocateInfo.commandPool = commandPool;
+    allocateInfo.commandBufferCount = 1;
+    VkCommandBuffer commandBuffer{VK_NULL_HANDLE};
+    checkVk(vkAllocateCommandBuffers(ctx.device, &allocateInfo, &commandBuffer),
+            "vkAllocateCommandBuffers");
 
     VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO; beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
-
-    VkBufferCopy copyRegion{};
-    copyRegion.size = vertexSize; vkCmdCopyBuffer(cmd, stagingVertexBuffer, vertexBuffer, 1, &copyRegion);
-    copyRegion.size = indexSize; vkCmdCopyBuffer(cmd, stagingIndexBuffer, indexBuffer, 1, &copyRegion);
-    vkEndCommandBuffer(cmd);
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    checkVk(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer");
+    VkBufferCopy copy{};
+    copy.size = vertexSize;
+    vkCmdCopyBuffer(commandBuffer, stagingVertexBuffer, vertexBuffer, 1, &copy);
+    copy.size = indexSize;
+    vkCmdCopyBuffer(commandBuffer, stagingIndexBuffer, indexBuffer, 1, &copy);
+    checkVk(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
 
     VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO; submitInfo.commandBufferCount = 1; submitInfo.pCommandBuffers = &cmd;
-    vkQueueSubmit(ctx.graphics_queue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(ctx.graphics_queue);
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+    checkVk(vkQueueSubmit(ctx.graphics_queue, 1, &submitInfo, VK_NULL_HANDLE), "vkQueueSubmit");
+    checkVk(vkQueueWaitIdle(ctx.graphics_queue), "vkQueueWaitIdle");
 
-    vmaDestroyBuffer(ctx.allocator, stagingVertexBuffer, stagingVertexAlloc);
-    vmaDestroyBuffer(ctx.allocator, stagingIndexBuffer, stagingIndexAlloc);
-    vkFreeCommandBuffers(ctx.device, tempCommandPool, 1, &cmd);
-    vkDestroyCommandPool(ctx.device, tempCommandPool, nullptr);
+    vmaDestroyBuffer(ctx.allocator, stagingVertexBuffer, stagingVertexAllocation);
+    vmaDestroyBuffer(ctx.allocator, stagingIndexBuffer, stagingIndexAllocation);
+    vkFreeCommandBuffers(ctx.device, commandPool, 1, &commandBuffer);
+    vkDestroyCommandPool(ctx.device, commandPool, nullptr);
 }
 
-void createUniformBuffer() {
-    VkDeviceSize bufferSize = sizeof(UniformBufferObject);
-    createBuffer(bufferSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, uniformBuffer, uniformBufferAllocation);
-    vmaMapMemory(graphics::internal::context.allocator, uniformBufferAllocation, &uniformBufferMapped);
+void createDescriptorSetLayouts() {
+    const std::array<VkDescriptorSetLayoutBinding, 3> sceneBindings{{
+        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+    }};
+    VkDescriptorSetLayoutCreateInfo sceneInfo{};
+    sceneInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    sceneInfo.bindingCount = static_cast<uint32_t>(sceneBindings.size());
+    sceneInfo.pBindings = sceneBindings.data();
+    checkVk(vkCreateDescriptorSetLayout(device(), &sceneInfo, nullptr, &sceneDescriptorSetLayout),
+            "vkCreateDescriptorSetLayout(scene)");
+
+    const VkDescriptorSetLayoutBinding modelBinding{
+        0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo modelInfo{};
+    modelInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    modelInfo.bindingCount = 1;
+    modelInfo.pBindings = &modelBinding;
+    checkVk(vkCreateDescriptorSetLayout(device(), &modelInfo, nullptr, &modelDescriptorSetLayout),
+            "vkCreateDescriptorSetLayout(model)");
 }
 
-void createDescriptorPoolAndSet() {
-    auto& ctx = graphics::internal::context;
-    VkDescriptorPoolSize poolSize{}; poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; poolSize.descriptorCount = 1;
+void updateStorageDescriptor(uint32_t binding, const MappedStorageBuffer& storage,
+                            VkDeviceSize range) {
+    VkDescriptorBufferInfo bufferInfo{storage.buffer, 0, range};
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = sceneDescriptorSet;
+    write.dstBinding = binding;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.descriptorCount = 1;
+    write.pBufferInfo = &bufferInfo;
+    vkUpdateDescriptorSets(device(), 1, &write, 0, nullptr);
+}
+
+void createStorageBuffer(MappedStorageBuffer& storage, VkDeviceSize capacity,
+                         VkDeviceSize elementSize, uint32_t binding) {
+    const VkDeviceSize bufferSize = capacity * elementSize;
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(graphics::internal::context.physical_device, &properties);
+    if (bufferSize > properties.limits.maxStorageBufferRange) {
+        throw std::runtime_error("Light array exceeds maxStorageBufferRange");
+    }
+
+    VkBuffer buffer{VK_NULL_HANDLE};
+    VmaAllocation allocation{VK_NULL_HANDLE};
+    void* mapped{nullptr};
+    createMappedBuffer(bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, buffer, allocation, mapped);
+    if (storage.buffer != VK_NULL_HANDLE) {
+        vmaUnmapMemory(graphics::internal::context.allocator, storage.allocation);
+        vmaDestroyBuffer(graphics::internal::context.allocator, storage.buffer, storage.allocation);
+    }
+    storage.buffer = buffer;
+    storage.allocation = allocation;
+    storage.mapped = mapped;
+    storage.capacity = capacity;
+    updateStorageDescriptor(binding, storage, bufferSize);
+}
+
+void ensureStorageCapacity(MappedStorageBuffer& storage, size_t count,
+                           VkDeviceSize elementSize, uint32_t binding) {
+    if (count <= storage.capacity) {
+        return;
+    }
+    VkDeviceSize newCapacity = std::max<VkDeviceSize>(storage.capacity, 1);
+    while (newCapacity < count) {
+        newCapacity *= 2;
+    }
+    checkVk(vkDeviceWaitIdle(device()), "vkDeviceWaitIdle");
+    createStorageBuffer(storage, newCapacity, elementSize, binding);
+}
+
+void createUniformBuffers() {
+    createMappedBuffer(sizeof(SceneUniformBuffer), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                       sceneUniformBuffer, sceneUniformBufferAllocation, sceneUniformBufferMapped);
+    createMappedBuffer(sizeof(ModelUniformBuffer), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                       modelUniformBuffer, modelUniformBufferAllocation, modelUniformBufferMapped);
+}
+
+void createDescriptorPoolAndSets() {
+    const std::array<VkDescriptorPoolSize, 2> poolSizes{{
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},
+    }};
     VkDescriptorPoolCreateInfo poolInfo{};
-    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO; poolInfo.poolSizeCount = 1; poolInfo.pPoolSizes = &poolSize; poolInfo.maxSets = 1;
-    vkCreateDescriptorPool(ctx.device, &poolInfo, nullptr, &descriptorPool);
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.maxSets = 2;
+    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
+    checkVk(vkCreateDescriptorPool(device(), &poolInfo, nullptr, &descriptorPool),
+            "vkCreateDescriptorPool");
 
-    VkDescriptorSetAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO; allocInfo.descriptorPool = descriptorPool;
-    allocInfo.descriptorSetCount = 1; allocInfo.pSetLayouts = &descriptorSetLayout;
-    vkAllocateDescriptorSets(ctx.device, &allocInfo, &descriptorSet);
+    const std::array<VkDescriptorSetLayout, 2> layouts{
+        sceneDescriptorSetLayout, modelDescriptorSetLayout};
+    std::array<VkDescriptorSet, 2> sets{};
+    VkDescriptorSetAllocateInfo allocateInfo{};
+    allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocateInfo.descriptorPool = descriptorPool;
+    allocateInfo.descriptorSetCount = static_cast<uint32_t>(layouts.size());
+    allocateInfo.pSetLayouts = layouts.data();
+    checkVk(vkAllocateDescriptorSets(device(), &allocateInfo, sets.data()), "vkAllocateDescriptorSets");
+    sceneDescriptorSet = sets[0];
+    modelDescriptorSet = sets[1];
 
-    VkDescriptorBufferInfo bufferInfo{}; bufferInfo.buffer = uniformBuffer; bufferInfo.offset = 0; bufferInfo.range = sizeof(UniformBufferObject);
-    VkWriteDescriptorSet descriptorWrite{};
-    descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; descriptorWrite.dstSet = descriptorSet;
-    descriptorWrite.dstBinding = 0; descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    descriptorWrite.descriptorCount = 1; descriptorWrite.pBufferInfo = &bufferInfo;
-    vkUpdateDescriptorSets(ctx.device, 1, &descriptorWrite, 0, nullptr);
+    const VkDeviceSize pointCapacity = std::max<size_t>(pointLights.size(), 1);
+    const VkDeviceSize spotCapacity = std::max<size_t>(spotLights.size(), 1);
+    createStorageBuffer(pointLightBuffer, pointCapacity, sizeof(PointLightGpu), 1);
+    createStorageBuffer(spotLightBuffer, spotCapacity, sizeof(SpotLightGpu), 2);
+
+    const VkDescriptorBufferInfo sceneBufferInfo{sceneUniformBuffer, 0, sizeof(SceneUniformBuffer)};
+    const VkDescriptorBufferInfo modelBufferInfo{modelUniformBuffer, 0, sizeof(ModelUniformBuffer)};
+    const std::array<VkWriteDescriptorSet, 2> writes{{
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sceneDescriptorSet, 0, 0, 1,
+         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &sceneBufferInfo, nullptr},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, modelDescriptorSet, 0, 0, 1,
+         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &modelBufferInfo, nullptr},
+    }};
+    vkUpdateDescriptorSets(device(), static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
 void createPipeline() {
-    auto& ctx = graphics::internal::context;
-    auto vertShaderCode = readFile("shaders/tetrahedron.vert.spv");
-    auto fragShaderCode = readFile("shaders/tetrahedron.frag.spv");
-    VkShaderModule vertShaderModule = createShaderModule(vertShaderCode);
-    VkShaderModule fragShaderModule = createShaderModule(fragShaderCode);
+    const auto vertCode = readFile("shaders/tetrahedron.vert.spv");
+    const auto fragCode = readFile("shaders/tetrahedron.frag.spv");
+    const VkShaderModule vertModule = createShaderModule(vertCode);
+    const VkShaderModule fragModule = createShaderModule(fragCode);
 
-    VkPipelineShaderStageCreateInfo vertShaderStageInfo{};
-    vertShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    vertShaderStageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT; vertShaderStageInfo.module = vertShaderModule; vertShaderStageInfo.pName = "main";
-    VkPipelineShaderStageCreateInfo fragShaderStageInfo{};
-    fragShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    fragShaderStageInfo.stage = VK_SHADER_STAGE_FRAGMENT_BIT; fragShaderStageInfo.module = fragShaderModule; fragShaderStageInfo.pName = "main";
-    VkPipelineShaderStageCreateInfo shaderStages[] = {vertShaderStageInfo, fragShaderStageInfo};
+    const std::array<VkPipelineShaderStageCreateInfo, 2> shaderStages{{
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+         VK_SHADER_STAGE_VERTEX_BIT, vertModule, "main", nullptr},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+         VK_SHADER_STAGE_FRAGMENT_BIT, fragModule, "main", nullptr},
+    }};
 
-    auto bindingDescription = Vertex::getBindingDescription();
-    auto attributeDescriptions = Vertex::getAttributeDescriptions();
+    const VkVertexInputBindingDescription bindingDescription = Vertex::getBindingDescription();
+    const auto attributeDescriptions = Vertex::getAttributeDescriptions();
     VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
     vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertexInputInfo.vertexBindingDescriptionCount = 1; vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
+    vertexInputInfo.vertexBindingDescriptionCount = 1;
+    vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
     vertexInputInfo.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributeDescriptions.size());
     vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions.data();
 
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
     inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; inputAssembly.primitiveRestartEnable = VK_FALSE;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
-    VkViewport viewport{};
-    viewport.x = 0.0f; viewport.y = 0.0f; viewport.width = (float)ctx.swapchain_extent.width;
-    viewport.height = (float)ctx.swapchain_extent.height; viewport.minDepth = 0.0f; viewport.maxDepth = 1.0f;
-    VkRect2D scissor{}; scissor.offset = {0, 0}; scissor.extent = ctx.swapchain_extent;
     VkPipelineViewportStateCreateInfo viewportState{};
     viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    viewportState.viewportCount = 1; viewportState.pViewports = &viewport; viewportState.scissorCount = 1; viewportState.pScissors = &scissor;
+    viewportState.viewportCount = 1;
+    viewportState.pViewports = nullptr;
+    viewportState.scissorCount = 1;
+    viewportState.pScissors = nullptr;
 
     VkPipelineRasterizationStateCreateInfo rasterizer{};
     rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rasterizer.depthClampEnable = VK_FALSE; rasterizer.rasterizerDiscardEnable = VK_FALSE;
-    rasterizer.polygonMode = VK_POLYGON_MODE_FILL; rasterizer.lineWidth = 1.0f;
-    rasterizer.cullMode = VK_CULL_MODE_NONE; rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizer.lineWidth = 1.0f;
 
     VkPipelineMultisampleStateCreateInfo multisampling{};
     multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisampling.sampleShadingEnable = VK_FALSE; multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
     VkPipelineDepthStencilStateCreateInfo depthStencil{};
     depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depthStencil.depthTestEnable = VK_TRUE; depthStencil.depthWriteEnable = VK_TRUE;
-    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS; depthStencil.depthBoundsTestEnable = VK_FALSE; depthStencil.stencilTestEnable = VK_FALSE;
+    depthStencil.depthTestEnable = VK_TRUE;
+    depthStencil.depthWriteEnable = VK_TRUE;
+    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
 
-    VkPipelineColorBlendAttachmentState colorBlendAttachment{};
-    colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    colorBlendAttachment.blendEnable = VK_FALSE;
+    VkPipelineColorBlendAttachmentState blendAttachment{};
+    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                     VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
     VkPipelineColorBlendStateCreateInfo colorBlending{};
     colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    colorBlending.logicOpEnable = VK_FALSE; colorBlending.attachmentCount = 1; colorBlending.pAttachments = &colorBlendAttachment;
+    colorBlending.attachmentCount = 1;
+    colorBlending.pAttachments = &blendAttachment;
 
+    const std::array<VkDynamicState, 2> dynamicStates{
+        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState{};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+    dynamicState.pDynamicStates = dynamicStates.data();
+
+    const std::array<VkDescriptorSetLayout, 2> setLayouts{
+        sceneDescriptorSetLayout, modelDescriptorSetLayout};
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
     pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pipelineLayoutInfo.setLayoutCount = 1; pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;
-    vkCreatePipelineLayout(ctx.device, &pipelineLayoutInfo, nullptr, &pipelineLayout);
+    pipelineLayoutInfo.setLayoutCount = static_cast<uint32_t>(setLayouts.size());
+    pipelineLayoutInfo.pSetLayouts = setLayouts.data();
+    checkVk(vkCreatePipelineLayout(device(), &pipelineLayoutInfo, nullptr, &pipelineLayout),
+            "vkCreatePipelineLayout");
 
     VkGraphicsPipelineCreateInfo pipelineInfo{};
-    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO; pipelineInfo.stageCount = 2; pipelineInfo.pStages = shaderStages;
-    pipelineInfo.pVertexInputState = &vertexInputInfo; pipelineInfo.pInputAssemblyState = &inputAssembly;
-    pipelineInfo.pViewportState = &viewportState; pipelineInfo.pRasterizationState = &rasterizer;
-    pipelineInfo.pMultisampleState = &multisampling; pipelineInfo.pDepthStencilState = &depthStencil;
-    pipelineInfo.pColorBlendState = &colorBlending; pipelineInfo.layout = pipelineLayout;
-    pipelineInfo.renderPass = ctx.render_pass; pipelineInfo.subpass = 0;
-    vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.stageCount = static_cast<uint32_t>(shaderStages.size());
+    pipelineInfo.pStages = shaderStages.data();
+    pipelineInfo.pVertexInputState = &vertexInputInfo;
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterizer;
+    pipelineInfo.pMultisampleState = &multisampling;
+    pipelineInfo.pDepthStencilState = &depthStencil;
+    pipelineInfo.pColorBlendState = &colorBlending;
+    pipelineInfo.pDynamicState = &dynamicState;
+    pipelineInfo.layout = pipelineLayout;
+    pipelineInfo.renderPass = graphics::internal::context.render_pass;
+    pipelineInfo.subpass = 0;
+    checkVk(vkCreateGraphicsPipelines(device(), VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline),
+            "vkCreateGraphicsPipelines");
 
-    vkDestroyShaderModule(ctx.device, fragShaderModule, nullptr);
-    vkDestroyShaderModule(ctx.device, vertShaderModule, nullptr);
+    vkDestroyShaderModule(device(), fragModule, nullptr);
+    vkDestroyShaderModule(device(), vertModule, nullptr);
+}
+
+glm::vec3 cameraForward() {
+    const float yaw = glm::radians(cameraYaw);
+    const float pitch = glm::radians(cameraPitch);
+    return glm::normalize(glm::vec3(std::cos(yaw) * std::cos(pitch),
+                                    std::sin(pitch),
+                                    std::sin(yaw) * std::cos(pitch)));
+}
+
+glm::vec3 safeNormalize(glm::vec3 value, glm::vec3 fallback) {
+    const float lengthSquared = glm::dot(value, value);
+    return lengthSquared > 1.0e-8f ? value / std::sqrt(lengthSquared) : fallback;
+}
+
+void updateUniformBuffers() {
+    const auto& extent = graphics::internal::context.swapchain_extent;
+    if (extent.width == 0 || extent.height == 0) {
+        return;
+    }
+    ensureStorageCapacity(pointLightBuffer, pointLights.size(), sizeof(PointLightGpu), 1);
+    ensureStorageCapacity(spotLightBuffer, spotLights.size(), sizeof(SpotLightGpu), 2);
+
+    const glm::mat4 model = glm::translate(glm::mat4(1.0f), modelPosition) *
+        glm::rotate(glm::mat4(1.0f), glm::radians(modelRotation.x), {1.0f, 0.0f, 0.0f}) *
+        glm::rotate(glm::mat4(1.0f), glm::radians(modelRotation.y), {0.0f, 1.0f, 0.0f}) *
+        glm::rotate(glm::mat4(1.0f), glm::radians(modelRotation.z), {0.0f, 0.0f, 1.0f}) *
+        glm::scale(glm::mat4(1.0f), glm::vec3(modelScale));
+    const glm::vec3 forward = cameraForward();
+    const glm::mat4 view = glm::lookAt(cameraPosition, cameraPosition + forward,
+                                       {0.0f, 1.0f, 0.0f});
+    const float aspectRatio = static_cast<float>(extent.width) / static_cast<float>(extent.height);
+    glm::mat4 projection = usePerspective
+        ? glm::perspective(glm::radians(fov), aspectRatio, 0.1f, 100.0f)
+        : glm::orthoRH_ZO(-orthographicSize * aspectRatio, orthographicSize * aspectRatio,
+                          -orthographicSize, orthographicSize, 0.1f, 100.0f);
+    projection[1][1] *= -1.0f;
+
+    const SceneUniformBuffer scene{
+        projection * view,
+        glm::vec4(cameraPosition, 1.0f),
+        glm::vec4(ambientColor, ambientIntensity),
+        glm::vec4(safeNormalize(directionalDirection, {0.0f, -1.0f, 0.0f}), 0.0f),
+        glm::vec4(directionalColor, directionalIntensity),
+        glm::uvec4(static_cast<uint32_t>(pointLights.size()),
+                   static_cast<uint32_t>(spotLights.size()), 0, 0),
+    };
+    const ModelUniformBuffer modelData{
+        model,
+        albedo,
+        glm::vec4(specularColor, 1.0f),
+        glm::vec4(shininess, 0.0f, 0.0f, 0.0f),
+    };
+    std::memcpy(sceneUniformBufferMapped, &scene, sizeof(scene));
+    std::memcpy(modelUniformBufferMapped, &modelData, sizeof(modelData));
+    checkVk(vmaFlushAllocation(graphics::internal::context.allocator,
+                               sceneUniformBufferAllocation, 0, sizeof(scene)),
+            "vmaFlushAllocation(scene)");
+    checkVk(vmaFlushAllocation(graphics::internal::context.allocator,
+                               modelUniformBufferAllocation, 0, sizeof(modelData)),
+            "vmaFlushAllocation(model)");
+    auto* pointData = static_cast<PointLightGpu*>(pointLightBuffer.mapped);
+    for (size_t i = 0; i < pointLights.size(); ++i) {
+        pointData[i] = {glm::vec4(pointLights[i].position, 1.0f),
+                        glm::vec4(pointLights[i].color, pointLights[i].intensity)};
+    }
+    auto* spotData = static_cast<SpotLightGpu*>(spotLightBuffer.mapped);
+    for (size_t i = 0; i < spotLights.size(); ++i) {
+        const auto& light = spotLights[i];
+        const float inner = glm::radians(std::min(light.innerAngle, light.outerAngle));
+        const float outer = glm::radians(std::max(light.innerAngle, light.outerAngle));
+        spotData[i] = {
+            glm::vec4(light.position, 1.0f),
+            glm::vec4(safeNormalize(light.direction, {0.0f, -1.0f, 0.0f}), 0.0f),
+            glm::vec4(light.color, light.intensity),
+            glm::vec4(std::cos(inner), std::cos(outer), 0.0f, 0.0f),
+        };
+    }
+    checkVk(vmaFlushAllocation(graphics::internal::context.allocator, pointLightBuffer.allocation,
+                               0, pointLightBuffer.capacity * sizeof(PointLightGpu)),
+            "vmaFlushAllocation(point lights)");
+    checkVk(vmaFlushAllocation(graphics::internal::context.allocator, spotLightBuffer.allocation,
+                               0, spotLightBuffer.capacity * sizeof(SpotLightGpu)),
+            "vmaFlushAllocation(spotlights)");
+}
+
+} // namespace
+
+VkPipeline pipeline{VK_NULL_HANDLE};
+VkPipelineLayout pipelineLayout{VK_NULL_HANDLE};
+VkBuffer vertexBuffer{VK_NULL_HANDLE};
+VkBuffer indexBuffer{VK_NULL_HANDLE};
+VmaAllocation vertexBufferAllocation{VK_NULL_HANDLE};
+VmaAllocation indexBufferAllocation{VK_NULL_HANDLE};
+std::vector<Vertex> vertices;
+std::vector<uint32_t> indices;
+
+VkVertexInputBindingDescription Vertex::getBindingDescription() {
+    return {0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
+}
+
+std::array<VkVertexInputAttributeDescription, 2> Vertex::getAttributeDescriptions() {
+    return {{
+        {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, pos)},
+        {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, normal)},
+    }};
 }
 
 bool initialize() {
     try {
         createTruncatedTetrahedron();
-        createDescriptorSetLayout();
-        createBuffers();
-        createUniformBuffer();
-        createDescriptorPoolAndSet();
+        createGeometryBuffers();
+        createDescriptorSetLayouts();
+        createUniformBuffers();
+        createDescriptorPoolAndSets();
         createPipeline();
         return true;
-    } catch (const std::exception& e) {
-        std::cerr << "Initialization error: " << e.what() << std::endl;
+    } catch (const std::exception& error) {
+        std::cerr << "Initialization error: " << error.what() << '\n';
+        shutdown();
         return false;
     }
 }
 
-// 5. DATA UPDATE (Задания 1, 2, 3)
-void updateUniformBuffer() {
-    UniformBufferObject ubo{};
-    auto& ctx = graphics::internal::context;
-    if (ctx.swapchain_extent.width == 0 || ctx.swapchain_extent.height == 0) return;
-
-    // 1. Матрица модели
-    ubo.model = glm::mat4(1.0f);
-    ubo.model = glm::translate(ubo.model, position);
-    ubo.model = glm::rotate(ubo.model, glm::radians(rotation.x), glm::vec3(1.0f, 0.0f, 0.0f));
-    ubo.model = glm::rotate(ubo.model, glm::radians(rotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
-    ubo.model = glm::rotate(ubo.model, glm::radians(rotation.z), glm::vec3(0.0f, 0.0f, 1.0f));
-    ubo.model = glm::scale(ubo.model, glm::vec3(scale, scale, scale));
-
-    float aspectRatio = (float)ctx.swapchain_extent.width / (float)ctx.swapchain_extent.height;
-
-    // 2. Матрицы вида и проекции
-    if (usePerspective) {
-        ubo.view = glm::lookAt(glm::vec3(0.0f, 0.0f, 5.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
-        ubo.proj = glm::perspective(glm::radians(fov), aspectRatio, 0.1f, 100.0f);
-        ubo.proj[1][1] *= -1.0f;
-    } else {
-        ubo.view = glm::lookAt(glm::vec3(0.0f, 0.0f, 5.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
-        
-        float orthoSize = 4.0f; 
-        ubo.proj = glm::orthoRH_ZO(-orthoSize * aspectRatio, orthoSize * aspectRatio, 
-                                   -orthoSize, orthoSize, 0.1f, 100.0f);
-        ubo.proj[1][1] *= -1.0f;
-    }
-    
-    ubo.baseColor = baseColor;
-
-    memcpy(uniformBufferMapped, &ubo, sizeof(ubo));
-}
-
 void update(double time) {
     static double lastTime = time;
-    double deltaTime = time - lastTime;
+    const double deltaTime = time - lastTime;
     lastTime = time;
-
-    // Задание 3: Сложная траектория (фигура Лиссажу + вращение)
     if (isAnimating) {
-        animTime += (float)deltaTime * animSpeed;
-        
-        // Движение по сложной траектории (восьмерка в плоскости XZ с колебанием по Y)
-        position.x = trajectoryRadius * sinf(animTime);
-        position.z = trajectoryRadius * cosf(animTime * 0.5f); 
-        position.y = sinf(animTime * 1.5f) * 0.5f;
-
-        // Одновременное вращение фигуры
-        rotation.y = animTime * 30.0f; // Быстрое вращение вокруг Y
-        rotation.x = sinf(animTime) * 15.0f; // Покачивание вокруг X
+        animationTime += static_cast<float>(deltaTime) * animationSpeed;
+        modelPosition = {
+            trajectoryRadius * std::sin(animationTime),
+            std::sin(animationTime * 1.5f) * 0.5f,
+            trajectoryRadius * std::cos(animationTime * 0.5f),
+        };
+        modelRotation = {
+            std::sin(animationTime) * 15.0f,
+            animationTime * 30.0f,
+            0.0f,
+        };
     }
-
-    updateUniformBuffer();
     buildImGui();
+    updateUniformBuffers();
 }
 
-// 6. RENDERING
-void render(const graphics::internal::FrameData& fd) {
-    if (fd.command_buffer == VK_NULL_HANDLE || pipeline == VK_NULL_HANDLE) return;
-    VkCommandBuffer cmd = fd.command_buffer;
-    auto& ctx = graphics::internal::context;
+void render(const graphics::internal::FrameData& frame) {
+    if (frame.command_buffer == VK_NULL_HANDLE || pipeline == VK_NULL_HANDLE) {
+        return;
+    }
 
+    const VkCommandBuffer commandBuffer = frame.command_buffer;
+    const auto& context = graphics::internal::context;
     VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO; beginInfo.flags = 0;
-    vkBeginCommandBuffer(cmd, &beginInfo);
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    checkVk(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer");
 
     VkRenderPassBeginInfo renderPassInfo{};
     renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    renderPassInfo.renderPass = ctx.render_pass; renderPassInfo.framebuffer = fd.framebuffer;
-    renderPassInfo.renderArea.offset = {0, 0}; renderPassInfo.renderArea.extent = ctx.swapchain_extent;
+    renderPassInfo.renderPass = context.render_pass;
+    renderPassInfo.framebuffer = frame.framebuffer;
+    renderPassInfo.renderArea.extent = context.swapchain_extent;
+    std::array<VkClearValue, 2> clearValues{};
+    clearValues[0].color = {{0.025f, 0.03f, 0.045f, 1.0f}};
+    clearValues[1].depthStencil = {1.0f, 0};
+    renderPassInfo.clearValueCount = static_cast<uint32_t>(clearValues.size());
+    renderPassInfo.pClearValues = clearValues.data();
+    vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
-    VkClearValue clearValues[2];
-    clearValues[0].color = {{0.1f, 0.1f, 0.1f, 1.0f}}; clearValues[1].depthStencil = {1.0f, 0};
-    renderPassInfo.clearValueCount = 2; renderPassInfo.pClearValues = clearValues;
-
-    vkCmdBeginRenderPass(cmd, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
-
-    VkViewport viewport{};
-    viewport.x = 0.0f; viewport.y = 0.0f; viewport.width = (float)ctx.swapchain_extent.width;
-    viewport.height = (float)ctx.swapchain_extent.height; viewport.minDepth = 0.0f; viewport.maxDepth = 1.0f;
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-
-    VkRect2D scissor{}; scissor.offset = {0, 0}; scissor.extent = ctx.swapchain_extent;
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
-
-    VkBuffer vertexBuffers[] = {vertexBuffer}; VkDeviceSize offsets[] = {0};
-    vkCmdBindVertexBuffers(cmd, 0, 1, vertexBuffers, offsets);
-    vkCmdBindIndexBuffer(cmd, indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
-
-    vkCmdDrawIndexed(cmd, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
-
-    vkCmdEndRenderPass(cmd);
-    vkEndCommandBuffer(cmd);
+    VkViewport viewport{0.0f, 0.0f,
+                        static_cast<float>(context.swapchain_extent.width),
+                        static_cast<float>(context.swapchain_extent.height), 0.0f, 1.0f};
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    VkRect2D scissor{{0, 0}, context.swapchain_extent};
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    const VkDeviceSize offset = 0;
+    vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &offset);
+    vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    const std::array<VkDescriptorSet, 2> sets{sceneDescriptorSet, modelDescriptorSet};
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
+                            0, static_cast<uint32_t>(sets.size()), sets.data(), 0, nullptr);
+    vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+    vkCmdEndRenderPass(commandBuffer);
+    checkVk(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
 }
 
-// 7. IMGUI INTERFACE (Задания 1, 2, 3, 4)
 void buildImGui() {
-    ImGui::Begin("Truncated Tetrahedron (Variant 4)");
-    
-    // Задание 4: Изменение цвета фигуры
-    ImGui::Text("Figure Color");
-    ImGui::ColorEdit4("Base Color", (float*)&baseColor);
-    ImGui::Separator();
-
-    // Задание 2: Позиция, поворот, растяжение
-    ImGui::Text("Transformations");
-    ImGui::SliderFloat3("Position", (float*)&position, -5.0f, 5.0f);
-    ImGui::SliderFloat3("Rotation (deg)", (float*)&rotation, -180.0f, 180.0f);
-    ImGui::SliderFloat("Scale", &scale, 0.1f, 3.0f);
-    ImGui::Separator();
-
-    // Задание 3: Анимация и траектория
-    ImGui::Text("Animation & Trajectory");
-    ImGui::Checkbox("Enable Animation", &isAnimating);
-    if (isAnimating) {
-        ImGui::SliderFloat("Speed", &animSpeed, 0.1f, 5.0f);
-        ImGui::SliderFloat("Radius", &trajectoryRadius, 0.5f, 5.0f);
+    ImGui::Begin("Blinn-Phong lighting | Truncated tetrahedron");
+    if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::DragFloat3("Position##camera", &cameraPosition.x, 0.05f, -20.0f, 20.0f);
+        ImGui::SliderFloat("Yaw", &cameraYaw, -180.0f, 180.0f);
+        ImGui::SliderFloat("Pitch", &cameraPitch, -89.0f, 89.0f);
+        ImGui::Checkbox("Perspective projection", &usePerspective);
+        if (usePerspective) {
+            ImGui::SliderFloat("Field of view", &fov, 15.0f, 100.0f, "%.1f deg");
+        } else {
+            ImGui::SliderFloat("Orthographic size", &orthographicSize, 1.0f, 10.0f);
+        }
+    }
+    if (ImGui::CollapsingHeader("Model and material", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::DragFloat3("Position##model", &modelPosition.x, 0.02f, -5.0f, 5.0f);
+        ImGui::SliderFloat3("Rotation (degrees)", &modelRotation.x, -180.0f, 180.0f);
+        ImGui::SliderFloat("Scale", &modelScale, 0.1f, 3.0f);
+        ImGui::ColorEdit3("Albedo", &albedo.x);
+        ImGui::ColorEdit3("Specular color", &specularColor.x);
+        ImGui::SliderFloat("Shininess", &shininess, 1.0f, 256.0f, "%.0f");
+        ImGui::Checkbox("Animate model", &isAnimating);
+        if (isAnimating) {
+            ImGui::SliderFloat("Animation speed", &animationSpeed, 0.1f, 5.0f);
+            ImGui::SliderFloat("Trajectory radius", &trajectoryRadius, 0.5f, 5.0f);
+        }
+    }
+    if (ImGui::CollapsingHeader("Ambient light", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::ColorEdit3("Ambient color", &ambientColor.x);
+        ImGui::SliderFloat("Ambient intensity", &ambientIntensity, 0.0f, 2.0f);
+    }
+    if (ImGui::CollapsingHeader("Directional light", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::DragFloat3("Direction##directional", &directionalDirection.x, 0.02f, -1.0f, 1.0f);
+        ImGui::ColorEdit3("Color##directional", &directionalColor.x);
+        ImGui::SliderFloat("Intensity##directional", &directionalIntensity, 0.0f, 5.0f);
+    }
+    if (ImGui::CollapsingHeader("Point lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::Button("Add point light")) {
+            pointLights.emplace_back();
+        }
+        for (size_t i = 0; i < pointLights.size(); ++i) {
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::Separator();
+            ImGui::Text("Point light %zu", i + 1);
+            ImGui::DragFloat3("Position", &pointLights[i].position.x, 0.05f, -10.0f, 10.0f);
+            ImGui::ColorEdit3("Color", &pointLights[i].color.x);
+            ImGui::SliderFloat("Intensity", &pointLights[i].intensity, 0.0f, 100.0f);
+            if (ImGui::Button("Remove point light")) {
+                pointLights.erase(pointLights.begin() + static_cast<std::ptrdiff_t>(i));
+                ImGui::PopID();
+                break;
+            }
+            ImGui::PopID();
+        }
+    }
+    if (ImGui::CollapsingHeader("Spotlights", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::Button("Add spotlight")) {
+            spotLights.emplace_back();
+        }
+        for (size_t i = 0; i < spotLights.size(); ++i) {
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::Separator();
+            ImGui::Text("Spotlight %zu", i + 1);
+            ImGui::DragFloat3("Position", &spotLights[i].position.x, 0.05f, -10.0f, 10.0f);
+            ImGui::DragFloat3("Direction", &spotLights[i].direction.x, 0.02f, -1.0f, 1.0f);
+            ImGui::ColorEdit3("Color", &spotLights[i].color.x);
+            ImGui::SliderFloat("Intensity", &spotLights[i].intensity, 0.0f, 100.0f);
+            ImGui::SliderFloat("Inner angle", &spotLights[i].innerAngle, 1.0f, 88.5f, "%.1f deg");
+            ImGui::SliderFloat("Outer angle", &spotLights[i].outerAngle, 1.0f, 89.0f, "%.1f deg");
+            if (spotLights[i].outerAngle < spotLights[i].innerAngle + 0.5f) {
+                spotLights[i].outerAngle = std::min(spotLights[i].innerAngle + 0.5f, 89.0f);
+            }
+            if (ImGui::Button("Remove spotlight")) {
+                spotLights.erase(spotLights.begin() + static_cast<std::ptrdiff_t>(i));
+                ImGui::PopID();
+                break;
+            }
+            ImGui::PopID();
+        }
     }
     ImGui::Separator();
-
-    // Задание 1: Переключение проекции
-    ImGui::Text("Projection");
-    ImGui::Checkbox("Perspective Projection", &usePerspective);
-    if (usePerspective) {
-        ImGui::SliderFloat("Field of View (FOV)", &fov, 10.0f, 120.0f);
-    }
-    
-    ImGui::Separator();
-    ImGui::Text("Vertices: %zu, Indices: %zu", vertices.size(), indices.size());
-    ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
-    
+    ImGui::Text("Vertices: %zu | Triangles: %zu", vertices.size(), indices.size() / 3);
+    ImGui::Text("%.1f FPS", ImGui::GetIO().Framerate);
     ImGui::End();
 }
 
-// 8. CLEANUP
 void shutdown() {
-    auto& ctx = graphics::internal::context;
-    vkDeviceWaitIdle(ctx.device);
-    vkDestroyPipeline(ctx.device, pipeline, nullptr);
-    vkDestroyPipelineLayout(ctx.device, pipelineLayout, nullptr);
-    vkDestroyDescriptorSetLayout(ctx.device, descriptorSetLayout, nullptr);
-    vkDestroyDescriptorPool(ctx.device, descriptorPool, nullptr);
-    vmaDestroyBuffer(ctx.allocator, vertexBuffer, vertexBufferAllocation);
-    vmaDestroyBuffer(ctx.allocator, indexBuffer, indexBufferAllocation);
-    vmaUnmapMemory(ctx.allocator, uniformBufferAllocation);
-    vmaDestroyBuffer(ctx.allocator, uniformBuffer, uniformBufferAllocation);
+    if (device() == VK_NULL_HANDLE) {
+        return;
+    }
+    vkDeviceWaitIdle(device());
+    vkDestroyPipeline(device(), pipeline, nullptr);
+    vkDestroyPipelineLayout(device(), pipelineLayout, nullptr);
+    vkDestroyDescriptorPool(device(), descriptorPool, nullptr);
+    vkDestroyDescriptorSetLayout(device(), modelDescriptorSetLayout, nullptr);
+    vkDestroyDescriptorSetLayout(device(), sceneDescriptorSetLayout, nullptr);
+    if (vertexBuffer != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(graphics::internal::context.allocator, vertexBuffer, vertexBufferAllocation);
+    }
+    if (indexBuffer != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(graphics::internal::context.allocator, indexBuffer, indexBufferAllocation);
+    }
+    if (sceneUniformBuffer != VK_NULL_HANDLE) {
+        if (sceneUniformBufferMapped != nullptr) {
+            vmaUnmapMemory(graphics::internal::context.allocator, sceneUniformBufferAllocation);
+        }
+        vmaDestroyBuffer(graphics::internal::context.allocator, sceneUniformBuffer, sceneUniformBufferAllocation);
+    }
+    if (modelUniformBuffer != VK_NULL_HANDLE) {
+        if (modelUniformBufferMapped != nullptr) {
+            vmaUnmapMemory(graphics::internal::context.allocator, modelUniformBufferAllocation);
+        }
+        vmaDestroyBuffer(graphics::internal::context.allocator, modelUniformBuffer, modelUniformBufferAllocation);
+    }
+    for (auto* storage : {&pointLightBuffer, &spotLightBuffer}) {
+        if (storage->buffer != VK_NULL_HANDLE) {
+            vmaUnmapMemory(graphics::internal::context.allocator, storage->allocation);
+            vmaDestroyBuffer(graphics::internal::context.allocator, storage->buffer, storage->allocation);
+        }
+    }
 }
 
 } // namespace application

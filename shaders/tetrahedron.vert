@@ -1,18 +1,30 @@
 #version 450
 
 layout(location = 0) in vec3 inPosition;
-layout(location = 1) in vec3 inColor;
+layout(location = 1) in vec3 inNormal;
 
-layout(location = 0) out vec3 fragColor;
+layout(set = 0, binding = 0, std140) uniform SceneUniformBuffer {
+    mat4 viewProjection;
+    vec4 cameraPosition;
+    vec4 ambientColorIntensity;
+    vec4 directionalDirection;
+    vec4 directionalColorIntensity;
+    uvec4 lightCounts;
+} scene;
 
-layout(std140, binding = 0) uniform UniformBufferObject {
+layout(set = 1, binding = 0, std140) uniform ModelUniformBuffer {
     mat4 model;
-    mat4 view;
-    mat4 proj;
-    vec4 baseColor; // Добавлено для задания 4 и 5
-} ubo;
+    vec4 albedo;
+    vec4 specularColor;
+    vec4 materialParameters;
+} material;
+
+layout(location = 0) out vec3 fragPosition;
+layout(location = 1) out vec3 fragNormal;
 
 void main() {
-    gl_Position = ubo.proj * ubo.view * ubo.model * vec4(inPosition, 1.0);
-    fragColor = inColor; // Передаем процедурный цвет во фрагментный шейдер
+    vec4 worldPosition = material.model * vec4(inPosition, 1.0);
+    fragPosition = worldPosition.xyz;
+    fragNormal = mat3(transpose(inverse(material.model))) * inNormal;
+    gl_Position = scene.viewProjection * worldPosition;
 }
