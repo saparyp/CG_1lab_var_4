@@ -54,12 +54,19 @@ FetchContent_Declare(
     GIT_TAG 1.0.1
 )
 
+FetchContent_Declare(
+    stb
+    GIT_REPOSITORY https://github.com/nothings/stb.git
+    GIT_TAG 013ac3beddff3dbffafd5177e7972067cd2b5083
+)
+
 FetchContent_MakeAvailable(
     glfw
     vk-bootstrap
     VulkanMemoryAllocator
     imgui
     glm
+    stb
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -91,7 +98,8 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 	GPUOpen::VulkanMemoryAllocator
 )
 
-target_include_directories(${PROJECT_NAME} PRIVATE ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+target_include_directories(${PROJECT_NAME} PRIVATE ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends
+    ${stb_SOURCE_DIR})
 target_sources(${PROJECT_NAME} PRIVATE
 	${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
 	${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
@@ -132,3 +140,9 @@ if(GLSLC_FOUND)
 	add_custom_target(shaders DEPENDS ${_SHADER_BINARIES})
 	add_dependencies(${PROJECT_NAME} shaders)
 endif()
+
+add_custom_target(copy_texture_assets ALL
+	COMMAND ${CMAKE_COMMAND} -E copy_directory
+		${CMAKE_SOURCE_DIR}/assets $<TARGET_FILE_DIR:${PROJECT_NAME}>/assets
+	COMMENT "Copying texture assets")
+add_dependencies(${PROJECT_NAME} copy_texture_assets)

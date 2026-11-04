@@ -2,6 +2,7 @@
 
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
+layout(location = 2) in vec2 inUv;
 
 layout(set = 0, binding = 0, std140) uniform SceneUniformBuffer {
     mat4 viewProjection;
@@ -21,10 +22,12 @@ layout(set = 1, binding = 0, std140) uniform ModelUniformBuffer {
 
 layout(location = 0) out vec3 fragPosition;
 layout(location = 1) out vec3 fragNormal;
+layout(location = 2) out vec2 fragUv;
 
 void main() {
     vec4 worldPosition = material.model * vec4(inPosition, 1.0);
     fragPosition = worldPosition.xyz;
     fragNormal = mat3(transpose(inverse(material.model))) * inNormal;
+    fragUv = inUv;
     gl_Position = scene.viewProjection * worldPosition;
 }

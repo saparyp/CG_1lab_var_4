@@ -12,9 +12,9 @@ namespace application {
 struct Vertex {
     glm::vec3 pos;
     glm::vec3 normal;
-    
+    glm::vec2 uv;
     static VkVertexInputBindingDescription getBindingDescription();
-    static std::array<VkVertexInputAttributeDescription, 2> getAttributeDescriptions();
+    static std::array<VkVertexInputAttributeDescription, 3> getAttributeDescriptions();
 };
 
 extern std::vector<Vertex> vertices;
