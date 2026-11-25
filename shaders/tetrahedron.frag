@@ -7,6 +7,7 @@ layout(location = 0) out vec4 outColor;
 
 layout(set = 0, binding = 0, std140) uniform SceneUniformBuffer {
     mat4 viewProjection;
+    mat4 lightViewProjection;
     vec4 cameraPosition;
     vec4 ambientColorIntensity;
     vec4 directionalDirection;
@@ -24,6 +25,7 @@ layout(set = 1, binding = 0, std140) uniform ModelUniformBuffer {
 layout(set = 2, binding = 0) uniform sampler2D albedoTexture;
 layout(set = 2, binding = 1) uniform sampler2D specularTexture;
 layout(set = 2, binding = 2) uniform sampler2D emissiveTexture;
+layout(set = 0, binding = 3) uniform sampler2DShadow shadowMap;
 
 layout(push_constant) uniform SamplingParameters {
     uint enabled;
@@ -89,9 +91,20 @@ void main() {
                     scene.ambientColorIntensity.a;
 
     vec3 directional = normalize(-scene.directionalDirection.xyz);
-    lighting += blinnPhong(normal, viewDirection, directional,
-                           scene.directionalColorIntensity.rgb *
-                           scene.directionalColorIntensity.a, surfaceColor, specularMask);
+    vec4 shadowPosition = scene.lightViewProjection * vec4(fragPosition, 1.0);
+    shadowPosition.xyz /= shadowPosition.w;
+    vec3 shadowCoordinates = shadowPosition.xyz;
+    shadowCoordinates.xy = shadowCoordinates.xy * 0.5 + 0.5;
+    float visibility = 1.0;
+    if (all(greaterThanEqual(shadowCoordinates, vec3(0.0))) &&
+        all(lessThanEqual(shadowCoordinates, vec3(1.0)))) {
+        visibility = texture(shadowMap,
+                             vec3(shadowCoordinates.xy, shadowCoordinates.z - 0.001));
+    }
+    lighting += visibility * blinnPhong(normal, viewDirection, directional,
+                                        scene.directionalColorIntensity.rgb *
+                                        scene.directionalColorIntensity.a,
+                                        surfaceColor, specularMask);
 
     for (uint i = 0; i < scene.lightCounts.x; ++i) {
         PointLight light = pointLightBuffer.lights[i];

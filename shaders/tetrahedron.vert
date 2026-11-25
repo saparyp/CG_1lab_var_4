@@ -6,6 +6,7 @@ layout(location = 2) in vec2 inUv;
 
 layout(set = 0, binding = 0, std140) uniform SceneUniformBuffer {
     mat4 viewProjection;
+    mat4 lightViewProjection;
     vec4 cameraPosition;
     vec4 ambientColorIntensity;
     vec4 directionalDirection;
